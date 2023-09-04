@@ -23,13 +23,13 @@ def padding_tokens(tokens, max_seq_length, pad_token, direct, max_context_length
 
 class FT_Dataset(Dataset):
 
-    def __init__(self, ft_file, batch_size, max_seq_length):
+    def __init__(self, ft_file, batch_size, max_seq_length, max_eval_length=0):
         self.ft_file = ft_file
         self.ft_samples = self.read_ft_file(self.ft_file)
         self.batch_size = batch_size
         self.num_examples = len(self.ft_samples)  # 41061
         self.max_seq_length = max_seq_length
-        self.max_eval_length = 0
+        self.max_eval_length = max_eval_length
         self.rng = random.Random(911)
 
         self.num_batches = int((self.num_examples + self.batch_size - 1) / self.batch_size)

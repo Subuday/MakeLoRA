@@ -1,3 +1,4 @@
+import copy
 import math
 
 import torch
@@ -81,7 +82,7 @@ class Attention(nn.Module):
         else:
             return x.permute(0, 2, 1, 3).contiguous()  # (batch, head, seq_length, head_features)
 
-    def _attn(self, q, k, v):
+    def _attn(self, q, k, v, len_kv=None):
         w = torch.matmul(q, k)
         assert w.shape == (q.shape[0], q.shape[1], q.shape[2], k.shape[3])
 
@@ -95,6 +96,15 @@ class Attention(nn.Module):
         w = w * b - 1e10 * (1 - b)
         assert w.shape == w_shape
 
+        # q : (batch, head, q_seq_length, head_features)
+        # k : (batch, head, head_features, kv_seq_length)
+        # w : (batch, head, q_seq_length, kv_seq_length)
+        # v : (batch, head, kv_seq_length, head_features)
+        if len_kv is not None:
+            _len = torch.arange(k.size(-1), device=k.device)
+            _input_msk = _len[None, :] >= (len_kv)[:, None]
+            w = w.masked_fill(_input_msk.unsqueeze(1).unsqueeze(2), -1.0e10)
+
         w = nn.Softmax(dim=-1)(w)
         result = torch.matmul(w, v)
         assert result.shape == (w.shape[0], w.shape[1], w.shape[2], v.shape[3])
@@ -106,7 +116,7 @@ class Attention(nn.Module):
         new_x_shape = x.size()[:-2] + (x.size(-2) * x.size(-1),)
         return x.view(*new_x_shape)  # in Tensorflow implem: fct merge_states
 
-    def forward(self, x):
+    def forward(self, x, layer_past=None, len_past=None):
         hidden_states = x
 
         x = self.c_attn(x)
@@ -117,10 +127,33 @@ class Attention(nn.Module):
         key = self.split_heads(key, k=True)
         value = self.split_heads(value)
 
+        len_kv = None
+
+        if layer_past is not None:
+            if len_past is None:
+                past_key, past_value = layer_past[0].transpose(-2, -1), layer_past[1]  # transpose back cf below
+                key = torch.cat((past_key, key), dim=-1)
+                value = torch.cat((past_value, value), dim=-2)
+            else:
+                key_seq = key.shape[-1]
+                assert key_seq == 1
+
+                _batch = torch.arange(0, key.shape[0], dtype=torch.long, device=key.device)
+
+                past_key, past_value = layer_past[0], layer_past[1]
+
+                past_key[_batch, :, len_past, :] = key.squeeze(-1)
+                past_value[_batch, :, len_past, :] = value.squeeze(-2)
+
+                key = past_key.transpose(-2, -1)
+                value = past_value
+
+                len_kv = len_past + 1
+
         present = torch.stack((key.transpose(-2, -1), value))  # transpose to have same shapes for stacking
         assert present.shape == (2, value.shape[0], value.shape[1], value.shape[2], value.shape[3])
 
-        a = self._attn(query, key, value)
+        a = self._attn(query, key, value, len_kv = len_kv)
         a = self.merge_heads(a)
         a = self.c_proj(a)
         return a, present
@@ -149,8 +182,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
         self.mlp = MLP(4 * config.n_embd, config)
 
-    def forward(self, x):
-        a, present = self.attn(self.ln_1(x))
+    def forward(self, x, layer_past=None, len_past=None):
+        a, present = self.attn(self.ln_1(x), layer_past=layer_past, len_past=len_past)
         x = x + a
         m = self.mlp(self.ln_2(x))
         x = x + m
@@ -167,15 +200,25 @@ class GPT2Model(nn.Module):
         self.h = nn.ModuleList([Block(config, scale=True) for _ in range(config.n_layer)])
         self.ln_f = LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
 
-    def forward(self, input_ids):
-        past_length = 0
-        position_ids = torch.arange(
-            past_length,
-            input_ids.size(-1) + past_length,
-            dtype=torch.long,
-            device=input_ids.device
-        )
-        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+    def forward(self, input_ids, past=None, len_past=None):
+        if past is None:
+            past_length = 0
+            past = [None] * len(self.h)
+        elif len_past is None:
+            # equal size for past. []
+            past_length = past[0][0].size(-2)
+
+        if len_past is None:
+            position_ids = torch.arange(
+                past_length,
+                input_ids.size(-1) + past_length,
+                dtype=torch.long,
+                device=input_ids.device
+            )
+            position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        elif len_past is not None:
+            position_ids = (len_past).unsqueeze(1)
+
         assert position_ids.shape == input_ids.shape
 
         input_shape = input_ids.size()
@@ -194,8 +237,8 @@ class GPT2Model(nn.Module):
         assert hidden_states.shape == (input_ids.shape[0], input_ids.shape[1], self.config.n_embd)
 
         presents = []
-        for block in self.h:
-            hidden_states, present = block(hidden_states)
+        for block, layer_past in zip(self.h, past):
+            hidden_states, present = block(hidden_states, layer_past = layer_past, len_past=len_past)
             presents.append(present)
         hidden_states = self.ln_f(hidden_states)
         output_shape = input_shape + (hidden_states.size(-1),)
@@ -260,34 +303,67 @@ class GPT2LMModel(nn.Module):
         self.lm_head = GPT2LMHead(self.transformer.wte.weight, config)
 
     def forward(
-            self,
-            input_ids,
-            lm_labels,
-            lm_mask,
-            label_smooth=0.0,
-            is_report_accuracy=False
+        self,
+        input_ids,
+        lm_labels=None,
+        lm_mask=None,
+        past=None,
+        len_past=None,
+        label_smooth=0.0,
+        is_report_accuracy=False
     ):
         _batch, _len = input_ids.shape
-        hidden_states, presents = self.transformer(input_ids)
+        hidden_states, presents = self.transformer(input_ids, past=past, len_past=len_past)
 
         # batch, seq, vocab
         lm_logits = self.lm_head(hidden_states)
 
-        if label_smooth > 0.0001:
-            logprobs = torch.nn.functional.log_softmax(lm_logits.view(-1, lm_logits.size(-1)), dim=-1)
-            nll_loss = -logprobs.gather(dim=-1, index=lm_labels.view(-1).unsqueeze(1))
-            nll_loss = nll_loss.squeeze(1)
-            smooth_loss = -logprobs.mean(dim=-1)
-            loss = (1.0 - label_smooth) * nll_loss + label_smooth * smooth_loss
-            loss = loss.view(_batch, _len)
-        else:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-1, reduce=False)
-            loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), lm_labels.view(-1)).view(_batch, _len)
+        if lm_labels is not None:
+            if label_smooth > 0.0001:
+                logprobs = torch.nn.functional.log_softmax(lm_logits.view(-1, lm_logits.size(-1)), dim=-1)
+                nll_loss = -logprobs.gather(dim=-1, index=lm_labels.view(-1).unsqueeze(1))
+                nll_loss = nll_loss.squeeze(1)
+                smooth_loss = -logprobs.mean(dim=-1)
+                loss = (1.0 - label_smooth) * nll_loss + label_smooth * smooth_loss
+                loss = loss.view(_batch, _len)
+            else:
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-1, reduce=False)
+                loss = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), lm_labels.view(-1)).view(_batch, _len)
 
-        loss = loss * lm_mask
-        loss = loss.sum() / (lm_mask.sum() + 0.0001)
+            loss = loss * lm_mask
+            loss = loss.sum() / (lm_mask.sum() + 0.0001)
 
-        return lm_logits, loss
+            return lm_logits, loss
+
+        return lm_logits, presents
+
+
+    def load_weight(self, state_dict):
+        if 'model_state_dict' in state_dict:
+            state_dict = state_dict['model_state_dict']
+
+        state_dict_tmp = copy.deepcopy(state_dict)
+        old_keys = []
+        new_keys = []
+        for key in state_dict_tmp:
+            new_key = None
+            if key.startswith("transformer."):
+                new_key = key[len("transformer."):]
+
+            if new_key:
+                old_keys.append(key)
+                new_keys.append(new_key)
+
+        for old_key, new_key in zip(old_keys, new_keys):
+            state_dict[new_key] = state_dict.pop(old_key)
+
+        for n, p in self.transformer.named_parameters():
+            if n not in state_dict:
+                assert False
+
+        self.transformer.load_state_dict(state_dict, strict=False)
+        self.lm_head.set_embeddings_weights(self.transformer.wte.weight)
+
 
 
 if __name__ == '__main__':
@@ -296,12 +372,12 @@ if __name__ == '__main__':
     batch = next(iter(dataloader))
     config = GPT2Config(n_embd=768, n_layer=12, n_head=12)
     model = GPT2LMModel(config=config)
-    _, loss = model(
-        input_ids=batch["input"],
-        lm_labels=batch["target"],
-        lm_mask=batch["mask"]
-    )
-    print(loss)
+    # _, loss = model(
+    #    input_ids=batch["input"],
+    #    lm_labels=batch["target"],
+    #    lm_mask=batch["mask"]
+    # )
+    # print(loss)
 
     # norm = LayerNorm(hidden_size=config.n_embd, eps=config.layer_norm_epsilon)
     # norm(x)
@@ -314,3 +390,6 @@ if __name__ == '__main__':
     #
     # block = Block(config=config, scale=True)
     # block(x)
+
+    cp = torch.load("./model/model.9000.pt", map_location=torch.device('cpu'))
+    model.load_weight(cp)

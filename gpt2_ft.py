@@ -97,6 +97,7 @@ def train_validate(
     avg_lm_loss = AverageMeter()
     print('start to train the model................', epoch)
     log_start_time = time.time()
+    best_val_ppl = None
 
     for idx, data in enumerate(train_loader):
         data = {key: value for key, value in data.items()}
@@ -131,8 +132,8 @@ def train_validate(
             model_path = os.path.join(args.work_dir, f'model.{train_step}.pt')
             if not os.path.exists(args.work_dir):
                 os.makedirs(args.work_dir)
-            print('saving checkpoint', model_path)
-            model_state_dict = {print(k) for k in model.state_dict()}
+            my_state_dict = model.state_dict()
+            model_state_dict = {k: my_state_dict[k] for k in my_state_dict}
             torch.save({'model_state_dict': model_state_dict}, model_path)
 
         if train_step % args.eval_interval == 0:
